@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+env/
+
+# API 키 (절대 커밋 금지)
+.env
+api/.env
+frontend/.env.local
+frontend/.env.*.local
+
+# Node.js / Next.js
+node_modules/
+.next/
+out/
+npm-debug.log*
+
+# 모델 캐시 (sentence-transformers 자동 다운로드)
+.cache/
+models/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Claude Code 내부 파일
+.claude/
+
+# 테스트 / 커버리지
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 로그
+*.log

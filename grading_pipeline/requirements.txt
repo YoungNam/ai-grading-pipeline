@@ -1,0 +1,20 @@
+# 핵심 워크플로우
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-core>=0.3.0
+
+# LLM API
+langchain-anthropic>=0.3.0        # Claude Opus 4.6 / Sonnet 4.6
+langchain-openai>=0.2.0           # GPT-5 mini
+langchain-google-genai>=2.0.0     # Gemini 2.5 Pro
+
+# Rule-base 엔진
+sympy>=1.13.0                     # 수식 동치성 검증
+# konlpy>=0.6.0                   # 국어 형태소 분석 (선택)
+# spacy>=3.8.0                    # 과학 의존 구문 분석 (선택)
+
+# 데이터베이스
+neo4j>=5.0.0                      # 그래프 DB (선택)
+
+# 유틸리티
+python-dotenv>=1.0.0
