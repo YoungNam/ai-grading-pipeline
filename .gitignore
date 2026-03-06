@@ -34,8 +34,9 @@ models/
 *.swp
 .DS_Store
 
-# Claude Code 내부 파일
-.claude/
+# Claude Code 내부 파일 (.claude/commands/ 는 버전 관리)
+.claude/*
+!.claude/commands/
 
 # 테스트 / 커버리지
 .pytest_cache/
