@@ -341,13 +341,13 @@ def ensemble_evaluator_node(state: GradingState) -> GradingState:
         ensemble_score = round(sum(scores) / len(scores), 1)
         ensemble_feedback = "\n\n".join(r["feedback"] for r in adjusted_results)
 
-    # 5. grand_total = Part1(rule_base_total) + Part2(ensemble_score)
-    grand_total = round(rule_base_total + ensemble_score, 2)
+    # grand_total = ensemble_score (Rule 10%는 이미 ensemble_score에 내장됨)
+    # rule_base_total은 진단용 비율 합산 수치이며 점수 단위가 아님 — 가산 금지
+    grand_total = ensemble_score
 
     logger.info(
-        "[Node3] 최종 점수: ensemble=%.1f + rule_base=%.2f = grand_total=%.2f (최대 %d+%d)",
-        ensemble_score, rule_base_total, grand_total,
-        state["total_score"], len(per_criterion_rule_scores),
+        "[Node3] 최종 점수: ensemble=%.1f / %d (rule_base 진단값=%.2f)",
+        ensemble_score, state["total_score"], rule_base_total,
     )
 
     return {

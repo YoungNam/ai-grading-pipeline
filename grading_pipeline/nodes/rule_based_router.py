@@ -212,8 +212,17 @@ def _score_math_per_criterion(
         hits = sum(1 for kw in kws if kw.lower() in student_lower)
         return round(hits / len(kws), 4)
 
-    # ── 케이스 2: 키워드가 있지만 수식 미포함 → 키워드 텍스트 매칭 ────────────
+    # ── 케이스 2: 키워드가 있지만 수식 미포함 → SymPy 우선, 실패 시 텍스트 매칭 ──
+    # 수학 과목에서 키워드가 텍스트 설명만 있어도 SymPy를 먼저 시도한다.
+    # (루브릭 생성 시 수식이 빠졌거나, 자동 감지 실패한 경우 대비)
     if kws:
+        if student_candidates and model_candidates:
+            for sc in student_candidates:
+                for mc in model_candidates:
+                    r = verify_math(sc, mc)
+                    if r.method != "error" and r.is_equivalent:
+                        return 1.0
+        # SymPy 실패(파싱 불가 또는 비동치) → 키워드 텍스트 매칭 폴백
         student_lower = student_full.lower()
         hits = sum(1 for kw in kws if kw.lower() in student_lower)
         return round(hits / len(kws), 4)

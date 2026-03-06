@@ -160,12 +160,14 @@ function RuleMetadataSection({ meta }: { meta: RuleMetadata }) {
           )}
         </div>
 
-        {/* 키워드 매칭 결과 (국어/일반) */}
+        {/* 키워드 매칭 결과 */}
         {(meta.keyword_hits.length > 0 || meta.keyword_misses.length > 0) && (
           <>
             <Separator />
             <div className="space-y-2">
-              <p className="text-xs font-medium text-muted-foreground">시맨틱 키워드 매칭</p>
+              <p className="text-xs font-medium text-muted-foreground">
+                {meta.subject_tag === "math" ? "키워드 포함 여부" : "시맨틱 키워드 매칭"}
+              </p>
               {meta.keyword_hits.length > 0 && (
                 <div className="flex flex-wrap gap-1">
                   {meta.keyword_hits.map((kw, i) => (

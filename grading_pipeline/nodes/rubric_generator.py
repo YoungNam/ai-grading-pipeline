@@ -11,7 +11,7 @@ import logging
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from grading_pipeline.prompts import RUBRIC_GENERATOR_SYSTEM, RUBRIC_GENERATOR_USER
+from grading_pipeline.prompts import RUBRIC_GENERATOR_SYSTEM, RUBRIC_GENERATOR_SYSTEM_MATH, RUBRIC_GENERATOR_USER
 from grading_pipeline.state import GradingState, Rubric
 
 logger = logging.getLogger(__name__)
@@ -42,8 +42,12 @@ def rubric_generator_node(state: GradingState) -> GradingState:
         total_score=state["total_score"],
     )
 
+    # 수학 과목: keywords에 실제 수식 포함을 위한 전용 프롬프트 사용
+    subject_tag = state.get("subject_tag", "auto")
+    system_content = RUBRIC_GENERATOR_SYSTEM_MATH if subject_tag == "math" else RUBRIC_GENERATOR_SYSTEM
+
     messages = [
-        SystemMessage(content=RUBRIC_GENERATOR_SYSTEM),
+        SystemMessage(content=system_content),
         HumanMessage(content=user_content),
     ]
 

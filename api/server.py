@@ -204,11 +204,12 @@ async def grade_stream(
         # ── HITL: 세션에 상태 저장 후 교사 대기 ────────────────────────────
         SESSIONS[thread_id] = state
 
-        # 모델별 세부 결과 (criterion_scores 포함)
+        # 모델별 세부 결과 (criterion_scores + original_llm_total 포함)
         evaluator_details = [
             {
                 "model_name": r["model_name"],
                 "total_score": r["total_score"],
+                "original_llm_total": r.get("original_llm_total"),
                 "feedback": r["feedback"],
                 "criterion_scores": r.get("criterion_scores", []),
             }

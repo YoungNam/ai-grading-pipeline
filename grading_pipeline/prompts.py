@@ -29,6 +29,24 @@ RUBRIC_GENERATOR_SYSTEM = """\
   ]
 }"""
 
+# 수학 전용 루브릭 생성 프롬프트
+# 수학은 Rule-base 엔진이 기준별 keywords에서 수식을 추출해 SymPy 동치 검사를 수행하므로
+# keywords에 반드시 실제 수식·방정식·최종 답을 포함해야 한다.
+RUBRIC_GENERATOR_SYSTEM_MATH = RUBRIC_GENERATOR_SYSTEM + """
+
+[수학 문항 전용 추가 지시]
+keywords 필드에는 해당 평가 기준에서 학생이 반드시 도출해야 하는 수식·방정식·계산 결과를 포함하십시오.
+- 각 기준의 핵심 수식/답을 keywords의 첫 번째 항목에 작성하세요.
+- 수식 표기: Python/SymPy가 파싱 가능한 형식으로 작성 (예: "f(x) = -2*x**2 + 40*x", "x = 10", "y = 200")
+- 등호가 있는 경우 반드시 포함하세요 (예: "x=10" 가 아닌 의미있는 등식 전체)
+- 서술형 텍스트(예: "이차함수 설정")는 description에만 작성하고 keywords에는 수식 우선
+- 수식이 없는 개념 기준(예: 단위 기재, 풀이 과정)은 핵심 수학 용어를 keywords에 포함
+
+예시:
+  기준: "이차함수 모델 설정" → keywords: ["f(x) = -2*x**2 + 40*x", "이차함수"]
+  기준: "최대값 계산"        → keywords: ["x = 10", "최대값 200", "200"]
+  기준: "결론 작성"          → keywords: ["최대 수익", "단위"]"""
+
 RUBRIC_GENERATOR_USER = """\
 [입력 데이터]
 평가 문항 및 모범 답안: {question_and_answer}
@@ -71,7 +89,7 @@ AGGREGATOR_SYSTEM = """\
 [채점 구조]
 - 입력된 평가 위원 점수는 이미 'Rule-base 10% + LLM 90%' 가중 조정이 완료된 값입니다.
 - 당신은 이 조정된 점수들을 검토하여 최종 AI 앙상블 점수(ensemble_score)를 산출합니다.
-- rule_base_total은 Python에서 별도 합산하여 grand_total = ensemble_score + rule_base_total 이 됩니다.
+- ensemble_score가 곧 최종 합산 점수입니다. Rule-base 기여분은 이미 내장되어 있습니다.
 
 [역할]
 1. 각 심사위원의 (조정된) 기준별 점수 편차를 분석하십시오.
