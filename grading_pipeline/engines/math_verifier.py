@@ -275,6 +275,10 @@ def verify_math(
     """
     수식 or 방정식을 자동 감지하여 적절한 검증 함수 호출.
     '=' 포함 시 방정식, 그 외는 표현식으로 처리.
+
+    혼합 케이스 처리:
+      - 학생: 순수 식, 모범: 등식(y = expr) → 모범 RHS 추출 후 표현식 비교
+      - 학생: 등식(y = expr), 모범: 순수 식 → 학생 RHS 추출 후 표현식 비교
     """
     s = student_answer.strip()
     m = model_answer.strip()
@@ -282,8 +286,41 @@ def verify_math(
     has_eq_student = "=" in s and not s.startswith("==")
     has_eq_model = "=" in m and not m.startswith("==")
 
+    # ── 양쪽 모두 등식 ────────────────────────────────────────────────────────
     if has_eq_student and has_eq_model:
+        # "y = f(x)" 형태 (좌변이 단일 변수)는 표현식 정의이므로 RHS끼리 비교
+        s_lhs, s_rhs = s.split("=", 1)[0].strip(), s.split("=", 1)[1].strip()
+        m_lhs, m_rhs = m.split("=", 1)[0].strip(), m.split("=", 1)[1].strip()
+        is_definition = (
+            re.fullmatch(r"[a-zA-Z]", s_lhs) or re.fullmatch(r"[a-zA-Z]\([^)]+\)", s_lhs) or
+            re.fullmatch(r"[a-zA-Z]", m_lhs) or re.fullmatch(r"[a-zA-Z]\([^)]+\)", m_lhs)
+        )
+        if is_definition:
+            # 양쪽 RHS를 표현식으로 비교
+            return verify_expression_equivalence(s_rhs, m_rhs)
         return verify_equation_equivalence(s, m, variable=variable)
+
+    # ── 양쪽 모두 순수 식: 직접 비교 ─────────────────────────────────────────
+    if not has_eq_student and not has_eq_model:
+        return verify_expression_equivalence(s, m)
+
+    # ── 혼합 케이스: 한쪽만 등식 ─────────────────────────────────────────────
+    # 등식에서 RHS(우변)를 추출해 순수 식 비교로 격하
+    if has_eq_model and not has_eq_student:
+        # 모범답안이 "y = expr" 형태 → RHS 추출
+        rhs_m = m.split("=", 1)[1].strip()
+        result = verify_expression_equivalence(s, rhs_m)
+        if result.is_equivalent or result.method != "error":
+            return result
+        # RHS 추출 비교도 오류면 원본 문자열로 표현식 비교 시도
+        return verify_expression_equivalence(s, m)
+
+    # has_eq_student and not has_eq_model
+    # 학생이 "y = expr" 형태 → RHS 추출
+    rhs_s = s.split("=", 1)[1].strip()
+    result = verify_expression_equivalence(rhs_s, m)
+    if result.is_equivalent or result.method != "error":
+        return result
     return verify_expression_equivalence(s, m)
 
 

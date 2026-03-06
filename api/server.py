@@ -20,18 +20,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-# ── 환경변수 로드 (.env 파일 존재 시 자동 로드, 없으면 시스템 환경변수 사용) ─────
+# ── 경로 설정 및 시크릿 로드 ──────────────────────────────────────────────────
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _PROJECT_ROOT)
 
-try:
-    from dotenv import load_dotenv
-    _env_path = os.path.join(_PROJECT_ROOT, ".env")
-    if os.path.exists(_env_path):
-        load_dotenv(_env_path, override=False)  # 이미 설정된 환경변수 우선
-        logging.getLogger(__name__).info(".env 파일 로드 완료: %s", _env_path)
-except ImportError:
-    pass  # python-dotenv 미설치 시 시스템 환경변수만 사용
+# 로깅 설정을 가장 먼저 (이후 임포트되는 모듈들의 경고 로그 포착)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s | %(message)s")
+
+# .env.enc 복호화 → os.environ 주입 (GRADING_MASTER_KEY 필요)
+from api.secrets import load_secrets
+load_secrets()
 
 # ── 필수 API 키 검증 ──────────────────────────────────────────────────────────
 def _check_api_keys() -> None:
@@ -65,7 +63,6 @@ from grading_pipeline.nodes.rule_based_router import rule_based_router_node
 from grading_pipeline.nodes.ensemble_evaluator import ensemble_evaluator_node
 from grading_pipeline.state import GradingState, initial_state
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s | %(message)s")
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="AI 채점 파이프라인 API", version="1.0.0")
@@ -218,14 +215,18 @@ async def grade_stream(
             for r in state.get("evaluator_results", [])
         ]
 
+        rule_meta = state.get("rule_metadata") or {}
         yield _sse("hitl_ready", {
             "thread_id": thread_id,
             "ensemble_score": state["ensemble_score"],
             "ensemble_feedback": state["ensemble_feedback"],
+            "grand_total": state.get("grand_total"),
+            "rule_base_total": rule_meta.get("rule_base_total", 0),
+            "per_criterion_rule_scores": rule_meta.get("per_criterion_rule_scores", {}),
             "total_score": total_score,
             "evaluator_results": evaluator_details,
             "debate_log": state.get("debate_log", []),
-            "rule_metadata": state.get("rule_metadata"),
+            "rule_metadata": rule_meta,
         })
 
     return StreamingResponse(

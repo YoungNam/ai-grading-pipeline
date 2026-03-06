@@ -36,24 +36,34 @@ logger = logging.getLogger(__name__)
 _DEBATE_THRESHOLD = 1.5  # 심사위원 간 총점 표준편차가 이 값 초과 시 토론 가동
 
 # ── LLM 클라이언트 초기화 ─────────────────────────────────────────────────────
-# NOTE: API 키는 환경변수 ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY로 설정
+# NOTE: 패키지 미설치 또는 API 키 미설정 시 해당 모델 비활성화 (서버 시작은 계속 진행)
+import os as _os
+
 try:
     from langchain_openai import ChatOpenAI
-    _gpt = ChatOpenAI(model="gpt-4o-mini", temperature=0.2, max_tokens=1024)
-    _HAS_GPT = True
+    if _os.environ.get("OPENAI_API_KEY"):
+        _gpt = ChatOpenAI(model="gpt-4o-mini", temperature=0.2, max_tokens=4096)
+        _HAS_GPT = True
+    else:
+        _HAS_GPT = False
+        logger.warning("OPENAI_API_KEY 미설정 — GPT 평가 비활성화")
 except ImportError:
     _HAS_GPT = False
     logger.warning("langchain_openai 미설치 — GPT 평가 비활성화")
 
 try:
     from langchain_google_genai import ChatGoogleGenerativeAI
-    _gemini = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.2)
-    _HAS_GEMINI = True
+    if _os.environ.get("GOOGLE_API_KEY"):
+        _gemini = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.2)
+        _HAS_GEMINI = True
+    else:
+        _HAS_GEMINI = False
+        logger.warning("GOOGLE_API_KEY 미설정 — Gemini 평가 비활성화")
 except ImportError:
     _HAS_GEMINI = False
     logger.warning("langchain_google_genai 미설치 — Gemini 평가 비활성화")
 
-# Anthropic 모델은 항상 사용 가능 (Claude Sonnet 4.6)
+# Anthropic 모델은 항상 사용 (ANTHROPIC_API_KEY는 server.py startup에서 필수 검증)
 _claude = ChatAnthropic(model="claude-sonnet-4-6", temperature=0.2, max_tokens=4096)
 _claude_aggregator = ChatAnthropic(model="claude-opus-4-6", temperature=0.1, max_tokens=2048)
 
@@ -119,6 +129,51 @@ def _run_parallel_evaluators(state: GradingState) -> list[EvaluatorResult]:
     return results
 
 
+# ── Rule-base 10% / LLM 90% 기준별 점수 조정 ────────────────────────────────
+def _adjust_criterion_scores(
+    evaluator_results: list[EvaluatorResult],
+    per_criterion_rule_scores: dict[str, float],
+    rubric: dict,
+) -> list[EvaluatorResult]:
+    """
+    각 평가 결과의 기준별 점수를 LLM 90% + Rule-base 10%로 조정.
+
+    조정식: adjusted_ratio = 0.9 × (llm_score / max_score) + 0.1 × rule_ratio
+            adjusted_score = adjusted_ratio × max_score
+    """
+    max_scores: dict[str, float] = {
+        item["criterion_id"]: float(item["max_score"])
+        for item in rubric.get("rubric_items", [])
+    }
+
+    adjusted: list[EvaluatorResult] = []
+    for result in evaluator_results:
+        new_criterion_scores = []
+        for cs in result["criterion_scores"]:
+            cid = cs["criterion_id"]
+            max_s = max_scores.get(cid, 1.0)
+            llm_ratio = cs["score"] / max_s if max_s > 0 else 0.0
+            rule_ratio = per_criterion_rule_scores.get(cid, 0.0)
+            adjusted_ratio = 0.9 * llm_ratio + 0.1 * rule_ratio
+            adjusted_score = round(adjusted_ratio * max_s, 2)
+            new_criterion_scores.append({
+                **cs,
+                "score": adjusted_score,
+                "original_llm_score": cs["score"],
+                "rule_ratio": round(rule_ratio, 4),
+                "rationale": cs["rationale"],
+            })
+
+        adjusted_total = round(sum(c["score"] for c in new_criterion_scores), 2)
+        adjusted.append({
+            **result,
+            "criterion_scores": new_criterion_scores,
+            "total_score": adjusted_total,
+            "original_llm_total": result["total_score"],
+        })
+    return adjusted
+
+
 # ── 편차 분석 및 Debate ───────────────────────────────────────────────────────
 def _detect_high_variance_criteria(
     results: list[EvaluatorResult],
@@ -179,13 +234,34 @@ def _run_debate(
 def _aggregate(
     results: list[EvaluatorResult],
     state: GradingState,
+    per_criterion_rule_scores: dict[str, float],
+    rule_base_total: float,
 ) -> tuple[float, str]:
     """가중 평균 점수 + 최종 피드백 생성"""
     total_score = state["rubric"]["total_score"]
     threshold_str = str(_DEBATE_THRESHOLD)
 
+    # rule-base 감점 항목 정리 (점수 < 1.0)
+    rubric_items_by_id = {
+        item["criterion_id"]: item.get("description", item["criterion_id"])
+        for item in state["rubric"].get("rubric_items", [])
+    }
+    rule_base_info = {
+        "per_criterion": {
+            cid: {
+                "score": score,
+                "description": rubric_items_by_id.get(cid, cid),
+                "deducted": score < 1.0,
+            }
+            for cid, score in per_criterion_rule_scores.items()
+        },
+        "rule_base_total": round(rule_base_total, 2),
+        "max_possible": len(per_criterion_rule_scores),
+    }
+
     aggregator_user = AGGREGATOR_USER.format(
         total_score=total_score,
+        rule_base_info=json.dumps(rule_base_info, ensure_ascii=False, indent=2),
         evaluator_results=json.dumps(
             [
                 {
@@ -224,40 +300,63 @@ def ensemble_evaluator_node(state: GradingState) -> GradingState:
     if not state.get("rubric"):
         return {**state, "error_message": "루브릭 없음 — Node1 실패 여부 확인"}
 
+    # rule-base per-criterion 점수 수집
+    rule_metadata = state.get("rule_metadata") or {}
+    per_criterion_rule_scores: dict[str, float] = rule_metadata.get("per_criterion_rule_scores") or {}
+    rule_base_total: float = rule_metadata.get("rule_base_total") or 0.0
+    rubric = state.get("rubric") or {}
+
     # 1. 병렬 평가
     try:
         evaluator_results = _run_parallel_evaluators(state)
     except RuntimeError as e:
         return {**state, "error_message": str(e)}
 
-    # 2. 편차 분석 → Debate
-    scores = [r["total_score"] for r in evaluator_results]
+    # 2. Rule-base 10% / LLM 90% 기준별 점수 조정
+    if per_criterion_rule_scores and rubric:
+        adjusted_results = _adjust_criterion_scores(
+            evaluator_results, per_criterion_rule_scores, rubric
+        )
+    else:
+        adjusted_results = evaluator_results  # rule-base 없으면 원본 유지
+
+    # 3. 편차 분석 → Debate (조정된 점수 기준)
+    scores = [r["total_score"] for r in adjusted_results]
     total_std = statistics.stdev(scores) if len(scores) > 1 else 0.0
-    logger.info("[Node3] 심사위원 총점 표준편차: %.2f", total_std)
+    logger.info("[Node3] 심사위원 총점 표준편차(조정후): %.2f", total_std)
 
     debate_log: list[str] = []
     if total_std > _DEBATE_THRESHOLD:
         logger.info("[Node3] 점수 편차 초과 — Debate 체인 가동")
-        high_var = _detect_high_variance_criteria(evaluator_results)
-        debate_log = _run_debate(evaluator_results, high_var)
+        high_var = _detect_high_variance_criteria(adjusted_results)
+        debate_log = _run_debate(adjusted_results, high_var)
 
-    # 3. 최종 집계
+    # 4. 최종 집계 (ensemble_score = Part 2)
     try:
-        ensemble_score, ensemble_feedback = _aggregate(evaluator_results, state)
+        ensemble_score, ensemble_feedback = _aggregate(
+            adjusted_results, state, per_criterion_rule_scores, rule_base_total
+        )
     except Exception as e:
         logger.error("[Node3] Aggregator 실패: %s", e)
-        # 폴백: 단순 평균
         ensemble_score = round(sum(scores) / len(scores), 1)
-        ensemble_feedback = "\n\n".join(r["feedback"] for r in evaluator_results)
+        ensemble_feedback = "\n\n".join(r["feedback"] for r in adjusted_results)
 
-    logger.info("[Node3] 최종 앙상블 점수: %.1f / %d", ensemble_score, state["total_score"])
+    # 5. grand_total = Part1(rule_base_total) + Part2(ensemble_score)
+    grand_total = round(rule_base_total + ensemble_score, 2)
+
+    logger.info(
+        "[Node3] 최종 점수: ensemble=%.1f + rule_base=%.2f = grand_total=%.2f (최대 %d+%d)",
+        ensemble_score, rule_base_total, grand_total,
+        state["total_score"], len(per_criterion_rule_scores),
+    )
 
     return {
         **state,
-        "evaluator_results": evaluator_results,
+        "evaluator_results": adjusted_results,
         "debate_log": debate_log,
         "ensemble_score": ensemble_score,
         "ensemble_feedback": ensemble_feedback,
+        "grand_total": grand_total,
     }
 
 

@@ -113,6 +113,151 @@ def morpheme_overlap_ratio(student_text: str, model_text: str) -> float:
     return len(intersection) / len(model_tokens)
 
 
+# ── 시맨틱 키워드 매칭 (국어/일반 전용) ──────────────────────────────────────
+
+# 동의어 판단 기준 코사인 유사도 임계값 (구 수준 비교 기준)
+_KEYWORD_SIM_THRESHOLD = 0.60
+
+
+def select_top_keywords(keywords: list[str], n: int = 2) -> list[str]:
+    """
+    키워드 목록에서 상위 n개를 선택한다.
+    루브릭 생성기가 중요도 순으로 키워드를 배열한다고 가정하고 앞에서 n개 반환.
+    n보다 적으면 전체 반환.
+    """
+    return keywords[:n] if len(keywords) > n else list(keywords)
+
+
+def _build_comparison_phrases(content_words: list[str]) -> list[str]:
+    """
+    내용어 목록에서 SBERT 비교 대상 구(phrase)를 생성한다.
+
+    단일 2글자 한국어 단어는 SBERT 임베딩 공간에서 모두 ~0.9955로 수렴하여
+    의미 구분이 불가능하다. 이를 피하기 위해:
+      - 3글자 이상 단어: 단독 사용
+      - 연속 2단어 바이그램: "권력 독점" 처럼 조합
+      - 연속 3단어 트라이그램: 더 많은 문맥
+    이렇게 구 수준으로 비교하면 2글자 단어의 임베딩 붕괴 문제를 우회할 수 있다.
+    """
+    phrases: list[str] = []
+    # 3자 이상 단독어
+    phrases.extend(w for w in content_words if len(w) >= 3)
+    # 연속 2단어 바이그램
+    phrases.extend(
+        content_words[i] + " " + content_words[i + 1]
+        for i in range(len(content_words) - 1)
+    )
+    # 연속 3단어 트라이그램
+    phrases.extend(
+        content_words[i] + " " + content_words[i + 1] + " " + content_words[i + 2]
+        for i in range(len(content_words) - 2)
+    )
+    return phrases if phrases else [" ".join(content_words)] if content_words else []
+
+
+def semantic_keyword_match(
+    keyword: str,
+    student_text: str,
+    threshold: float = _KEYWORD_SIM_THRESHOLD,
+) -> tuple[bool, float]:
+    """
+    키워드가 학생 답안에 의미적으로 포함되어 있는지 판단.
+
+    3단계 전략:
+      1. 정확 텍스트 포함 여부 (빠른 경로)
+      2. 형태소 공유 매칭: 2자 이상 공통 부분 공유 시 동의 변형으로 인정
+         예: "광합성" ↔ "합성하다" → "합성" 공유 → 매칭
+      3. SBERT 구(phrase) 수준 비교:
+         - 2글자 단어 단독 비교 시 SBERT 임베딩이 ~0.9955로 수렴하는 문제 회피
+         - 3자 이상 단어 + 바이그램/트라이그램 조합과 비교
+         - 임계값 0.60 (단어↔단어 0.72보다 낮음, 구 수준 범위에 최적화)
+
+    반환: (is_match: bool, max_similarity: float)
+    """
+    student_lower = student_text.lower()
+
+    # 1단계: 정확 포함 (빠른 경로)
+    if keyword.lower() in student_lower:
+        return True, 1.0
+
+    try:
+        content_words = extract_content_words(student_text)
+
+        # 2단계: 형태소 공유 매칭
+        kw_lower = keyword.lower()
+        for word in content_words:
+            w = word.lower()
+            # 어느 한 쪽이 다른 쪽을 포함하면 동의 변형으로 인정 (최소 2자)
+            if (kw_lower in w or w in kw_lower) and min(len(kw_lower), len(w)) >= 2:
+                return True, 0.92
+            # 4자 이상 키워드: 앞 2자 공유 시 인정 (예: "세포분열" ↔ "세포막")
+            if len(kw_lower) >= 4 and len(w) >= 2:
+                for n in range(2, min(len(kw_lower), len(w)) + 1):
+                    if kw_lower[:n] == w[:n]:
+                        return True, 0.88
+
+        # 3단계: SBERT 구(phrase) 수준 비교
+        phrases = _build_comparison_phrases(content_words)
+        if not phrases:
+            phrases = [student_text]
+
+        model = _get_sbert()
+        kw_emb = model.encode([keyword], convert_to_numpy=True)[0]
+        phrase_embs = model.encode(phrases, convert_to_numpy=True)
+        sims = cosine_similarity([kw_emb], phrase_embs)[0]
+        phrase_max = float(max(sims))
+
+        return phrase_max >= threshold, round(phrase_max, 4)
+
+    except Exception as e:
+        logger.warning("[NLP] 시맨틱 키워드 매칭 실패 (%s): %s", keyword, e)
+        return False, 0.0
+
+
+def score_keywords_semantic(
+    student_text: str,
+    rubric_items: list[dict],
+    threshold: float = _KEYWORD_SIM_THRESHOLD,
+) -> tuple[dict[str, float], list[str], list[str]]:
+    """
+    국어/일반 과목: 기준별 시맨틱 키워드 점수 산출.
+
+    - 기준당 최대 2개 키워드만 선택
+    - 각 키워드에 대해 semantic_keyword_match 수행
+    - 동의어/유사어 포함 시 매칭 인정
+
+    반환:
+      per_criterion_scores : {criterion_id: float(0~1)}
+      semantic_hits        : 매칭된 키워드 목록 (표시용)
+      semantic_misses      : 미매칭 키워드 목록 (표시용)
+    """
+    per_criterion_scores: dict[str, float] = {}
+    semantic_hits: list[str] = []
+    semantic_misses: list[str] = []
+
+    for item in rubric_items:
+        cid = item.get("criterion_id", "")
+        all_kws: list[str] = item.get("keywords", [])
+        top_kws = select_top_keywords(all_kws, n=2)
+
+        if not top_kws:
+            per_criterion_scores[cid] = 1.0  # 키워드 없는 기준은 만점
+            continue
+
+        matched = 0
+        for kw in top_kws:
+            is_match, sim = semantic_keyword_match(kw, student_text, threshold)
+            if is_match:
+                matched += 1
+                semantic_hits.append(f"{kw}(유사도:{sim:.2f})")
+            else:
+                semantic_misses.append(f"{kw}(유사도:{sim:.2f})")
+
+        per_criterion_scores[cid] = round(matched / len(top_kws), 4)
+
+    return per_criterion_scores, semantic_hits, semantic_misses
+
+
 # ── 문장 분리 ─────────────────────────────────────────────────────────────────
 
 def _split_into_chunks(text: str) -> list[str]:

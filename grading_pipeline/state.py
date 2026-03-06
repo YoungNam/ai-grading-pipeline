@@ -27,12 +27,15 @@ class Rubric(TypedDict):
 # ── Rule-base 엔진 메타데이터 ──────────────────────────────────────────────────
 class RuleMetadata(TypedDict):
     subject_tag: str                  # "math" | "korean" | "science"
-    rule_score: float                 # 규칙 기반 1차 점수
-    rule_max_score: float             # 규칙 기반 배점 합계
+    rule_score: float                 # 규칙 기반 1차 점수 (레거시 요약값)
+    rule_max_score: float             # 규칙 기반 배점 합계 (레거시)
     errors: list[dict[str, Any]]      # 오류 상세 [{type, span, message}, ...]
     math_equivalence: Optional[dict]  # SymPy 검증 결과 (수학 문항만)
     keyword_hits: list[str]           # 감지된 핵심 키워드
     keyword_misses: list[str]         # 누락된 핵심 키워드
+    # ── 신규: 기준별 rule-base 점수 ─────────────────────────────────────────
+    per_criterion_rule_scores: dict   # {criterion_id: float(0~1)}
+    rule_base_total: float            # sum(per_criterion_rule_scores.values()), max = 루브릭 항목 수
 
 
 # ── 개별 평가 모델 결과 ────────────────────────────────────────────────────────
@@ -69,8 +72,9 @@ class GradingState(TypedDict):
     # ---- Node 3: Ensemble Evaluator 출력 -------------------------------------
     evaluator_results: list[EvaluatorResult]  # 각 모델 독립 평가 결과
     debate_log: list[str]                     # 편차 발생 시 토론 로그
-    ensemble_score: Optional[float]           # 최종 앙상블 가중 평균 점수
+    ensemble_score: Optional[float]           # AI 앙상블 조정 점수 (Part 2)
     ensemble_feedback: Optional[str]          # 종합 피드백 문단
+    grand_total: Optional[float]              # Part1(rule_base_total) + Part2(ensemble_score)
 
     # ---- Node 4: HITL 출력 ---------------------------------------------------
     teacher_approved: Optional[bool]
@@ -103,6 +107,7 @@ def initial_state(
         debate_log=[],
         ensemble_score=None,
         ensemble_feedback=None,
+        grand_total=None,
         teacher_approved=None,
         teacher_correction=None,
         final_score=None,

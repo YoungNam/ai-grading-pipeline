@@ -16,7 +16,7 @@ import re
 from typing import Literal
 
 from grading_pipeline.engines.math_verifier import verify_math
-from grading_pipeline.engines.nlp_engine import score_korean, score_science
+from grading_pipeline.engines.nlp_engine import score_korean, score_science, score_keywords_semantic
 from grading_pipeline.state import GradingState, RuleMetadata
 
 logger = logging.getLogger(__name__)
@@ -55,36 +55,63 @@ def _extract_math_expressions(text: str) -> list[str]:
     자연어 답안에서 SymPy 파싱 가능한 수식 후보 목록을 추출.
 
     우선순위:
-    1. '따라서', '이므로', '∴' 뒤의 결론 문장 → "또는"/"," 기준으로 분리
-    2. 텍스트 전체에서 단순 수식 패턴 추출
+    1. 결론 지시어(따라서/이므로/∴) 앞·뒤 세그먼트 모두 수집
+    2. 등식(lhs = rhs) 패턴 전체 검색
+    3. 괄호 포함 다항 순수 식 패턴 (등호 없는 인수 형태 포함)
     """
     candidates: list[str] = []
+    clean_text = _KOR_STRIP.sub(" ", text)  # 한국어 제거 후 수식만 분석
 
-    # 1단계: 결론 지시어 뒤 텍스트 추출
+    # 1단계: 결론 지시어 기준으로 앞·뒤 세그먼트 모두 수집
     conclusion_re = re.compile(
-        r"(?:따라서|이므로|∴|결론|답)\s*[:\s]*(.+?)(?:\.|$)", re.MULTILINE
+        r"(?:따라서|이므로|∴|결론|답)\s*[:\s]*", re.MULTILINE
     )
-    for m in conclusion_re.finditer(text):
-        segment = m.group(1).strip()
-        # "또는", "," 로 분리된 다중 해를 개별 후보로
+    positions = [m.end() for m in conclusion_re.finditer(text)]
+    starts = [0] + positions          # 지시어 앞 세그먼트 시작점
+    ends = positions + [len(text)]    # 세그먼트 끝점
+
+    for start, end in zip(starts, ends):
+        segment = text[start:end]
         for part in _MULTI_SOL_SEP.split(segment):
             cleaned = _clean_expr(part)
             if cleaned:
                 candidates.append(cleaned)
 
-    # 2단계: 단순 수식 패턴 전체 검색 (보완)
-    for m in _SIMPLE_EXPR.finditer(text):
+    # 2단계: 등식 패턴 (lhs = rhs) 전체 검색
+    for m in _SIMPLE_EXPR.finditer(clean_text):
         cleaned = _clean_expr(m.group())
         if cleaned:
             candidates.append(cleaned)
 
-    # 중복 제거 + 길이 필터
+    # 3단계: 괄호 포함 순수 식 패턴 (등호 없는 인수·전개 형태)
+    # 예: x(40-2x), -2(x-10)^2+200, -2x^2+40x
+    _PURE_EXPR = re.compile(
+        r"-?\d*\.?\d*\s*[a-zA-Z]\s*\([^)=]{2,}\)"      # x(...)  형태
+        r"|-?\d+\s*\([^)=]{2,}\)\s*\*?\*?\d*"           # 2(...)  형태
+        r"|-?\d*\.?\d*\s*[a-zA-Z]\s*(?:\*\*\d+|\^\d+)"  # x^2, x**2 형태
+        r"|-?\d+\s*[a-zA-Z]\s*\^?\*?\*?\d*\s*[+\-][\s\d\*a-zA-Z\(\)\^\.\+\-]+"  # 다항 전개
+    )
+    for m in _PURE_EXPR.finditer(clean_text):
+        cleaned = _clean_expr(m.group())
+        if cleaned:
+            candidates.append(cleaned)
+
+    # 중복 제거 + 길이 필터 (너무 짧은 숫자 단독 후보는 제외)
     seen: set[str] = set()
     result: list[str] = []
     for c in candidates:
-        if len(c) >= 2 and c not in seen:
+        is_only_number = re.fullmatch(r"-?\d+\.?\d*", c)
+        if len(c) >= 3 and not is_only_number and c not in seen:
             seen.add(c)
             result.append(c)
+
+    # 순수 숫자 후보는 맨 뒤에 추가 (단독 비교 시 폴백용)
+    for c in candidates:
+        is_only_number = re.fullmatch(r"-?\d+\.?\d*", c)
+        if is_only_number and c not in seen:
+            seen.add(c)
+            result.append(c)
+
     return result
 
 
@@ -150,6 +177,74 @@ def _resolve_subject_tag(state: GradingState) -> SubjectTag:
     return "general"
 
 
+# ── 기준별 Rule-base 점수 헬퍼 ────────────────────────────────────────────────
+
+def _score_math_per_criterion(
+    student_candidates: list[str],
+    model_candidates: list[str],
+    criterion: dict,
+    student_full: str,
+) -> float:
+    """
+    단일 루브릭 기준에 대한 수학 rule-base 점수 (0~1).
+
+    우선순위:
+    1. 기준의 keywords에서 수식을 추출 → 학생 후보와 동치 검사
+    2. 수식이 없고 keywords만 있으면 → 키워드 포함 여부 (0~1)
+    3. keywords도 없으면 → 전체 모델 후보와 동치 검사 (기준 미상)
+    """
+    kws: list[str] = criterion.get("keywords", [])
+    desc: str = criterion.get("description", "")
+
+    # 키워드에서 수식 후보 추출 (description 제외 — 너무 광범위해 오탐 발생)
+    kw_text = " ".join(kws)
+    crit_math = _extract_math_expressions(kw_text) if kws else []
+
+    # ── 케이스 1: 키워드에 수식이 있으면 SymPy 동치 검사 ─────────────────────
+    if crit_math:
+        for sc in student_candidates:
+            for mc in crit_math:
+                r = verify_math(sc, mc)
+                if r.method != "error" and r.is_equivalent:
+                    return 1.0
+        # 동치 실패 → 키워드 텍스트 포함 여부로 부분 점수
+        student_lower = student_full.lower()
+        hits = sum(1 for kw in kws if kw.lower() in student_lower)
+        return round(hits / len(kws), 4)
+
+    # ── 케이스 2: 키워드가 있지만 수식 미포함 → 키워드 텍스트 매칭 ────────────
+    if kws:
+        student_lower = student_full.lower()
+        hits = sum(1 for kw in kws if kw.lower() in student_lower)
+        return round(hits / len(kws), 4)
+
+    # ── 케이스 3: 키워드 없음 → 전체 모델 후보와 동치 검사 ──────────────────
+    for sc in student_candidates:
+        for mc in model_candidates:
+            r = verify_math(sc, mc)
+            if r.method != "error" and r.is_equivalent:
+                return 1.0
+    return 0.5  # 판단 불가: 중간값
+
+
+def _score_keyword_per_criterion(
+    student_full: str,
+    rubric_items: list[dict],
+) -> dict[str, float]:
+    """키워드 기반 기준별 점수 (general / 폴백). {criterion_id: 0~1}"""
+    student_lower = student_full.lower()
+    scores: dict[str, float] = {}
+    for item in rubric_items:
+        cid = item.get("criterion_id", "")
+        kws: list[str] = item.get("keywords", [])
+        if not kws:
+            scores[cid] = 1.0  # 키워드 없는 기준은 만점
+        else:
+            hits = sum(1 for kw in kws if kw.lower() in student_lower)
+            scores[cid] = round(hits / len(kws), 4)
+    return scores
+
+
 # ── 수학 엔진 ─────────────────────────────────────────────────────────────────
 def _math_engine(state: GradingState) -> RuleMetadata:
     """
@@ -180,28 +275,55 @@ def _math_engine(state: GradingState) -> RuleMetadata:
     if not candidates:
         candidates = [student_full]
 
-    # 모범 답안도 동일하게 후보 추출 (한국어 혼재 대비)
-    model_candidates = _extract_math_expressions(model_ans) or [model_ans]
+    # 모범 답안 후보 추출 (한국어 혼재 대비)
+    # 한국어를 기준으로 세그먼트 분리 후 각각 추출 → 한국어 제거 시 식이 붙는 문제 방지
+    _kor_chunks = re.split(r"[가-힣]+", model_ans)
+    model_candidates: list[str] = []
+    for chunk in _kor_chunks:
+        chunk = chunk.strip()
+        if chunk:
+            for cand in _extract_math_expressions(chunk):
+                if cand not in model_candidates:
+                    model_candidates.append(cand)
+    # 등식 후보에서 RHS도 별도 추가 (f(x) = expr → expr 도 시도)
+    for mc in list(model_candidates):
+        if "=" in mc and not mc.startswith("=="):
+            rhs = mc.split("=", 1)[1].strip()
+            if rhs and rhs not in model_candidates:
+                model_candidates.append(rhs)
+    if not model_candidates:
+        model_candidates = [model_ans]
+
+    # 모든 후보 조합 시도 → 동치 판정 시 즉시 확정, 아니면 최초 파싱 성공 결과 보관
+    best_result = None
+    best_equiv = False
 
     for candidate in candidates:
         for model_cand in model_candidates:
             result = verify_math(candidate, model_cand)
             if result.method != "error":  # 파싱 성공
                 parse_attempted = True
-                math_equiv = result.to_dict()
-                math_equiv_score_ratio = 1.0 if result.is_equivalent else 0.0
-                if not result.is_equivalent:
-                    errors.append({
-                        "type": "MathEquivalenceError",
-                        "span": candidate,
-                        "message": (
-                            f"수식이 모범 답안과 동치가 아닙니다. "
-                            f"(방법: {result.method}, diff: {result.algebraic_diff})"
-                        ),
-                    })
-                break
-        if parse_attempted:
+                if result.is_equivalent:
+                    best_result = result
+                    best_equiv = True
+                    break
+                elif best_result is None:
+                    best_result = result  # 첫 번째 파싱 성공 결과 보관
+        if best_equiv:
             break
+
+    math_equiv = best_result.to_dict() if best_result else None
+    math_equiv_score_ratio = 1.0 if best_equiv else 0.0
+
+    if best_result is not None and not best_equiv:
+        errors.append({
+            "type": "MathEquivalenceError",
+            "span": candidates[0] if candidates else student_full[:80],
+            "message": (
+                f"수식이 모범 답안과 동치가 아닙니다. "
+                f"(방법: {best_result.method}, diff: {best_result.algebraic_diff})"
+            ),
+        })
 
     if not parse_attempted:
         # 모든 후보 파싱 실패 → 키워드 분석으로 대체
@@ -227,12 +349,23 @@ def _math_engine(state: GradingState) -> RuleMetadata:
 
     keyword_score_ratio = hit_score / total if total > 0 else 0.0
 
-    # ── 가중 합산 점수 ────────────────────────────────────────────────────────
+    # ── 기준별 rule-base 점수 (0~1) ──────────────────────────────────────────
+    rubric_items = rubric.get("rubric_items", [])
+    per_criterion_rule_scores: dict[str, float] = {}
+    for item in rubric_items:
+        cid = item.get("criterion_id", "")
+        per_criterion_rule_scores[cid] = _score_math_per_criterion(
+            student_candidates=candidates,
+            model_candidates=model_candidates,
+            criterion=item,
+            student_full=student_full,
+        )
+    rule_base_total = round(sum(per_criterion_rule_scores.values()), 4)
+
+    # ── 요약 점수 (레거시 호환) ────────────────────────────────────────────────
     if math_equiv is not None:
-        # 수식 파싱 성공: 동치성 60% + 키워드 40%
         rule_score = total * (0.6 * math_equiv_score_ratio + 0.4 * keyword_score_ratio)
     else:
-        # 수식 파싱 실패: 키워드 100%
         rule_score = total * keyword_score_ratio
 
     return RuleMetadata(
@@ -243,6 +376,8 @@ def _math_engine(state: GradingState) -> RuleMetadata:
         math_equivalence=math_equiv,
         keyword_hits=keyword_hits,
         keyword_misses=keyword_misses,
+        per_criterion_rule_scores=per_criterion_rule_scores,
+        rule_base_total=rule_base_total,
     )
 
 
@@ -271,12 +406,20 @@ def _korean_engine(state: GradingState) -> RuleMetadata:
     score_ratio, nlp_details = score_korean(student_text, model_text, rubric_items)
     rule_score = round(total * score_ratio, 2)
 
+    # 기준별 시맨틱 키워드 매칭 (기준당 상위 2개 키워드, 동의어 인정)
+    per_criterion_rule_scores, sem_hits, sem_misses = score_keywords_semantic(
+        student_text, rubric_items
+    )
+    rule_base_total = round(sum(per_criterion_rule_scores.values()), 4)
+
     logger.info(
-        "[Node2] 국어 점수: %.2f / %.0f (sem=%.2f, cov=%.2f, disc=%.2f)",
+        "[Node2] 국어 점수: %.2f / %.0f (sem=%.2f, cov=%.2f, disc=%.2f) | "
+        "키워드 매칭 rule_base=%.2f (hits=%d, misses=%d)",
         rule_score, total,
         nlp_details["semantic_similarity"],
         nlp_details["criterion_coverage"],
         nlp_details["discourse_structure"],
+        rule_base_total, len(sem_hits), len(sem_misses),
     )
 
     return RuleMetadata(
@@ -284,9 +427,11 @@ def _korean_engine(state: GradingState) -> RuleMetadata:
         rule_score=rule_score,
         rule_max_score=total,
         errors=errors,
-        math_equivalence=nlp_details,  # nlp_details를 확장 필드로 재활용
-        keyword_hits=keyword_hits,
-        keyword_misses=keyword_misses,
+        math_equivalence=nlp_details,
+        keyword_hits=sem_hits,
+        keyword_misses=sem_misses,
+        per_criterion_rule_scores=per_criterion_rule_scores,
+        rule_base_total=rule_base_total,
     )
 
 
@@ -311,13 +456,24 @@ def _science_engine(state: GradingState) -> RuleMetadata:
     score_ratio, nlp_details = score_science(student_text, model_text, keyword_hit_ratio)
     rule_score = round(total * score_ratio, 2)
 
+    # 기준별 SBERT 커버리지 → per_criterion_rule_scores (과학도 동일 방식)
+    from grading_pipeline.engines.nlp_engine import rubric_criterion_coverage
+    rubric_items = (state.get("rubric") or {}).get("rubric_items", [])
+    _, per_criterion_list = rubric_criterion_coverage(student_text, rubric_items)
+    per_criterion_rule_scores: dict[str, float] = {
+        item["criterion_id"]: round(item["coverage"], 4)
+        for item in per_criterion_list
+    }
+    rule_base_total = round(sum(per_criterion_rule_scores.values()), 4)
+
     logger.info(
-        "[Node2] 과학 점수: %.2f / %.0f (sem=%.2f, morph=%.2f, causal=%.2f, kw=%.2f)",
+        "[Node2] 과학 점수: %.2f / %.0f (sem=%.2f, morph=%.2f, causal=%.2f, kw=%.2f, rule_base=%.2f)",
         rule_score, total,
         nlp_details["semantic_similarity"],
         nlp_details["morpheme_overlap"],
         nlp_details["causal_structure_score"],
         nlp_details["keyword_hit_ratio"],
+        rule_base_total,
     )
 
     return RuleMetadata(
@@ -328,6 +484,8 @@ def _science_engine(state: GradingState) -> RuleMetadata:
         math_equivalence=nlp_details,
         keyword_hits=keyword_hits,
         keyword_misses=keyword_misses,
+        per_criterion_rule_scores=per_criterion_rule_scores,
+        rule_base_total=rule_base_total,
     )
 
 
@@ -373,12 +531,26 @@ def _keyword_miss_errors(keyword_misses: list[str]) -> list[dict]:
 
 # ── 공통 키워드 매칭 헬퍼 (general / 폴백) ────────────────────────────────────
 def _keyword_matching(state: GradingState, subject_tag: str) -> RuleMetadata:
+    """일반 과목: 시맨틱 키워드 매칭 (기준당 상위 2개 키워드, 동의어 인정)"""
     rubric = state.get("rubric") or {}
     total = float(rubric.get("total_score", 0))
+    rubric_items = rubric.get("rubric_items", [])
+    student_text = state["student_answer"]
 
-    keyword_hits, keyword_misses, hit_ratio = _calc_keyword_stats(state)
-    errors = _keyword_miss_errors(keyword_misses)
+    # 시맨틱 키워드 매칭으로 per-criterion 점수 산출
+    per_criterion_rule_scores, sem_hits, sem_misses = score_keywords_semantic(
+        student_text, rubric_items
+    )
+    rule_base_total = round(sum(per_criterion_rule_scores.values()), 4)
+
+    # 요약 점수 (레거시 호환: 기준별 평균)
+    hit_ratio = rule_base_total / len(rubric_items) if rubric_items else 0.0
     rule_score = round(total * hit_ratio, 2)
+
+    errors = [
+        {"type": "KeywordMissing", "span": "", "message": f"핵심어 미매칭: {kw}"}
+        for kw in sem_misses
+    ]
 
     return RuleMetadata(
         subject_tag=subject_tag,
@@ -386,6 +558,8 @@ def _keyword_matching(state: GradingState, subject_tag: str) -> RuleMetadata:
         rule_max_score=total,
         errors=errors,
         math_equivalence=None,
-        keyword_hits=keyword_hits,
-        keyword_misses=keyword_misses,
+        keyword_hits=sem_hits,
+        keyword_misses=sem_misses,
+        per_criterion_rule_scores=per_criterion_rule_scores,
+        rule_base_total=rule_base_total,
     )

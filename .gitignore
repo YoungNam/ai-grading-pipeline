@@ -10,8 +10,10 @@ venv/
 .venv/
 env/
 
-# API 키 (절대 커밋 금지)
+# API 키 평문 파일 (절대 커밋 금지)
 .env
+.env.*
+!.env.enc
 api/.env
 frontend/.env.local
 frontend/.env.*.local

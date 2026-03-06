@@ -29,12 +29,21 @@ export interface RuleMetadata {
   math_equivalence: Record<string, unknown> | null;
   keyword_hits: string[];
   keyword_misses: string[];
+  per_criterion_rule_scores: Record<string, number>;
+  rule_base_total: number;
 }
 
 export interface EvaluatorResult {
   model_name: string;
-  criterion_scores: Array<{ criterion_id: string; score: number; rationale: string }>;
+  criterion_scores: Array<{
+    criterion_id: string;
+    score: number;
+    rationale: string;
+    original_llm_score?: number;
+    rule_ratio?: number;
+  }>;
   total_score: number;
+  original_llm_total?: number;
   feedback: string;
 }
 
@@ -65,12 +74,22 @@ export type SSEEventData =
       thread_id: string;
       ensemble_score: number;
       ensemble_feedback: string;
+      grand_total: number | null;
+      rule_base_total: number;
+      per_criterion_rule_scores: Record<string, number>;
       total_score: number;
       evaluator_results: Array<{
         model_name: string;
         total_score: number;
+        original_llm_total?: number;
         feedback: string;
-        criterion_scores: Array<{ criterion_id: string; score: number; rationale: string }>;
+        criterion_scores: Array<{
+          criterion_id: string;
+          score: number;
+          rationale: string;
+          original_llm_score?: number;
+          rule_ratio?: number;
+        }>;
       }>;
       debate_log: string[];
       rule_metadata: RuleMetadata | null;

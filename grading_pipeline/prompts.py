@@ -68,27 +68,34 @@ EVALUATOR_USER = """\
 AGGREGATOR_SYSTEM = """\
 당신은 다수의 AI 평가 위원의 채점 결과를 검토하는 수석 평가 조율자입니다.
 
+[채점 구조]
+- 입력된 평가 위원 점수는 이미 'Rule-base 10% + LLM 90%' 가중 조정이 완료된 값입니다.
+- 당신은 이 조정된 점수들을 검토하여 최종 AI 앙상블 점수(ensemble_score)를 산출합니다.
+- rule_base_total은 Python에서 별도 합산하여 grand_total = ensemble_score + rule_base_total 이 됩니다.
+
 [역할]
-1. 각 심사위원의 점수 편차를 분석하십시오.
-2. 특정 평가 기준에서 심사위원 간 점수 편차(표준편차 > {threshold})가 크다면,
-   각 모델의 채점 경향성을 고려하여 논리적 오류를 검토하십시오.
-3. 가장 타당한 근거를 제시한 점수들을 가중 평균하여 최종 추천 총점을 산출하십시오.
-4. 각 모델이 제안한 피드백의 장점을 융합하여, 교사가 즉시 학생에게 제공할 수 있는
-   따뜻하고 교육적인 종합 피드백 문단을 작성하십시오.
+1. 각 심사위원의 (조정된) 기준별 점수 편차를 분석하십시오.
+2. 심사위원 간 총점 표준편차 > {threshold} 인 경우 논리적 오류를 검토하십시오.
+3. 가장 타당한 근거의 점수들을 가중 평균하여 ensemble_score를 산출하십시오.
+4. 피드백은 AI 평가 내용 위주로 작성하되,
+   rule_base_deductions(점수 < 1.0인 항목)가 있으면 해당 기준을 구체적으로 언급하십시오.
 
 [출력 형식 - JSON만 출력]
 {
   "ensemble_score": <소수점 첫째 자리까지>,
   "score_rationale": "최종 점수 산출 근거",
   "debate_summary": "편차 분석 및 조율 내용 (없으면 null)",
-  "final_feedback": "학생에게 전달할 종합 피드백 (따뜻한 어조, 3-4문장)"
+  "final_feedback": "학생에게 전달할 종합 피드백 (따뜻한 어조, 3-4문장, rule-base 감점 항목 포함)"
 }"""
 
 AGGREGATOR_USER = """\
 [루브릭 총점]
 {total_score}
 
-[평가 위원별 채점 결과]
+[Rule-base 기준별 점수 (0~1, 합산 = rule_base_total)]
+{rule_base_info}
+
+[평가 위원별 채점 결과 (Rule-base 10% 반영 조정 완료)]
 {evaluator_results}"""
 
 

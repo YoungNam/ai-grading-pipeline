@@ -24,12 +24,22 @@ export interface HitlReadyData {
   thread_id: string;
   ensemble_score: number;
   ensemble_feedback: string;
+  grand_total: number | null;
+  rule_base_total: number;
+  per_criterion_rule_scores: Record<string, number>;
   total_score: number;
   evaluator_results: Array<{
     model_name: string;
     total_score: number;
+    original_llm_total?: number;
     feedback: string;
-    criterion_scores: Array<{ criterion_id: string; score: number; rationale: string }>;
+    criterion_scores: Array<{
+      criterion_id: string;
+      score: number;
+      rationale: string;
+      original_llm_score?: number;
+      rule_ratio?: number;
+    }>;
   }>;
   debate_log: string[];
   rule_metadata: RuleMetadata | null;
@@ -153,6 +163,9 @@ export function useAgentStream() {
           thread_id: data.thread_id,
           ensemble_score: data.ensemble_score,
           ensemble_feedback: data.ensemble_feedback,
+          grand_total: data.grand_total ?? null,
+          rule_base_total: data.rule_base_total ?? 0,
+          per_criterion_rule_scores: data.per_criterion_rule_scores ?? {},
           total_score: data.total_score,
           evaluator_results: data.evaluator_results,
           debate_log: data.debate_log,
