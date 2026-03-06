@@ -129,45 +129,65 @@ function RuleMetadataSection({ meta }: { meta: RuleMetadata }) {
         </div>
       </CardHeader>
       <CardContent className="space-y-4">
-        {/* Part 1: 기준별 Rule-base 점수 */}
-        <div className="space-y-1.5">
-          <div className="flex items-center justify-between">
-            <p className="text-xs font-medium text-muted-foreground">Part 1 기준별 점수 (0~1 / 항목)</p>
-            <span className="text-xs font-bold text-primary">
-              합계 {meta.rule_base_total?.toFixed(2) ?? meta.rule_score.toFixed(2)} 점
-            </span>
-          </div>
-          {meta.per_criterion_rule_scores && Object.keys(meta.per_criterion_rule_scores).length > 0 ? (
-            <div className="space-y-1">
-              {Object.entries(meta.per_criterion_rule_scores).map(([cid, ratio]) => {
-                const pct = Math.round(ratio * 100);
-                const color = pct >= 80 ? "bg-green-500" : pct >= 40 ? "bg-amber-400" : "bg-red-400";
-                return (
-                  <div key={cid} className="flex items-center gap-2 text-xs">
-                    <span className="font-mono text-muted-foreground w-8 shrink-0">{cid}</span>
-                    <div className="flex-1 h-1.5 rounded-full bg-muted overflow-hidden">
-                      <div className={`h-full rounded-full ${color}`} style={{ width: `${pct}%` }} />
-                    </div>
-                    <span className={`w-12 text-right font-medium ${pct >= 80 ? "text-green-600" : pct >= 40 ? "text-amber-500" : "text-red-500"}`}>
-                      {ratio.toFixed(2)}
-                    </span>
-                  </div>
-                );
-              })}
+        {/* 수학: 전체 동치성 결과 요약 / 비수학: 기준별 Rule-base 점수 바 */}
+        {isMath ? (
+          /* 수학 — 단일 동치성 결과 */
+          <div className="space-y-1.5">
+            <p className="text-xs font-medium text-muted-foreground">수식 동치성 기반 Rule-base (전체 답안)</p>
+            <div className={`flex items-center gap-3 rounded-md border px-3 py-2.5 ${
+              mathEquiv?.is_equivalent ? "bg-green-50 border-green-200" : "bg-red-50 border-red-200"
+            }`}>
+              <span className={`text-xl font-bold ${mathEquiv?.is_equivalent ? "text-green-600" : "text-red-500"}`}>
+                {mathEquiv == null ? "—" : mathEquiv.is_equivalent ? "동치 ✓" : "비동치 ✗"}
+              </span>
+              <div className="text-xs text-muted-foreground leading-snug">
+                {mathEquiv == null
+                  ? "수식 파싱 실패 — Rule-base 점수 0 처리 (LLM 100% 의존)"
+                  : mathEquiv.is_equivalent
+                  ? "답안 수식이 모범 답안과 동치입니다. 모든 기준에 Rule-base 10% 반영됩니다."
+                  : "답안 수식이 모범 답안과 동치가 아닙니다. Rule-base 기여 없음."}
+              </div>
             </div>
-          ) : (
-            <ScoreBar value={meta.rule_score} max={meta.rule_max_score} />
-          )}
-        </div>
+          </div>
+        ) : (
+          /* 비수학 — 기준별 Rule-base 점수 바 */
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between">
+              <p className="text-xs font-medium text-muted-foreground">기준별 점수 (0~1 / 항목)</p>
+              <span className="text-xs font-bold text-primary">
+                합계 {meta.rule_base_total?.toFixed(2) ?? meta.rule_score.toFixed(2)}
+              </span>
+            </div>
+            {meta.per_criterion_rule_scores && Object.keys(meta.per_criterion_rule_scores).length > 0 ? (
+              <div className="space-y-1">
+                {Object.entries(meta.per_criterion_rule_scores).map(([cid, ratio]) => {
+                  const pct = Math.round(ratio * 100);
+                  const color = pct >= 80 ? "bg-green-500" : pct >= 40 ? "bg-amber-400" : "bg-red-400";
+                  return (
+                    <div key={cid} className="flex items-center gap-2 text-xs">
+                      <span className="font-mono text-muted-foreground w-8 shrink-0">{cid}</span>
+                      <div className="flex-1 h-1.5 rounded-full bg-muted overflow-hidden">
+                        <div className={`h-full rounded-full ${color}`} style={{ width: `${pct}%` }} />
+                      </div>
+                      <span className={`w-12 text-right font-medium ${pct >= 80 ? "text-green-600" : pct >= 40 ? "text-amber-500" : "text-red-500"}`}>
+                        {ratio.toFixed(2)}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <ScoreBar value={meta.rule_score} max={meta.rule_max_score} />
+            )}
+          </div>
+        )}
 
-        {/* 키워드 매칭 결과 */}
-        {(meta.keyword_hits.length > 0 || meta.keyword_misses.length > 0) && (
+        {/* 시맨틱 키워드 매칭 (국어/과학/일반만, 수학 제외) */}
+        {!isMath && (meta.keyword_hits.length > 0 || meta.keyword_misses.length > 0) && (
           <>
             <Separator />
             <div className="space-y-2">
-              <p className="text-xs font-medium text-muted-foreground">
-                {meta.subject_tag === "math" ? "키워드 포함 여부" : "시맨틱 키워드 매칭"}
-              </p>
+              <p className="text-xs font-medium text-muted-foreground">시맨틱 키워드 매칭</p>
               {meta.keyword_hits.length > 0 && (
                 <div className="flex flex-wrap gap-1">
                   {meta.keyword_hits.map((kw, i) => (
@@ -190,7 +210,7 @@ function RuleMetadataSection({ meta }: { meta: RuleMetadata }) {
           </>
         )}
 
-        {/* 수학 전용: 수식 동치성 검증 */}
+        {/* 수학 전용: 수식 동치성 검증 상세 카드 */}
         {mathEquiv && (
           <>
             <Separator />
@@ -470,6 +490,9 @@ function EnsembleDetailSection({
   }, 0);
   const totalLlmContribution = Math.round((data.ensemble_score - totalRuleContribution) * 100) / 100;
 
+  // 수학 과목 여부 (Rule(10%) 표시 방식 결정)
+  const isMathSubject = data.rule_metadata?.subject_tag === "math";
+
   // 모델별 합산 레이블 축약
   function modelLabel(name: string) {
     return name.replace("claude-sonnet-", "sonnet-").replace("claude-opus-", "opus-")
@@ -506,6 +529,11 @@ function EnsembleDetailSection({
         {/* 기준별 세부 점수 테이블 */}
         {criterionIds.length > 0 && (
           <div className="overflow-x-auto">
+            {isMathSubject && (
+              <p className="text-xs text-amber-700 bg-amber-50 rounded px-2 py-1 mb-2">
+                수학: Rule(10%) 열은 전체 수식 동치성 결과를 모든 기준에 균등 적용한 값입니다.
+              </p>
+            )}
             <Table>
               <TableHeader>
                 <TableRow>

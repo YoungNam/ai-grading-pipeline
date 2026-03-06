@@ -257,35 +257,28 @@ def _score_keyword_per_criterion(
 # ── 수학 엔진 ─────────────────────────────────────────────────────────────────
 def _math_engine(state: GradingState) -> RuleMetadata:
     """
-    SymPy 수식 동치성 검증 + 키워드 적중률 → 가중 합산 점수
+    SymPy 수식 동치성 검증 단일 결과 → 전체 기준에 균등 적용 (10% 가중치)
 
-    점수 산출:
-      - 수식 동치성 (가중치 60%): 학생 답안에서 수식 후보 추출 후 SymPy 검증
-      - 키워드 적중률 (가중치 40%): 루브릭 키워드가 학생 답안에 포함되는지 확인
-      단, 수식 파싱 자체가 불가능하면 키워드 100%로 대체
+    설계 원칙:
+      - 수학은 키워드 텍스트 매칭을 완전히 제거. 수식 동치성만으로 Rule-base 평가.
+      - 전체 답안 동치 검사 결과(0.0 / 1.0)를 루브릭의 모든 기준에 동일하게 적용.
+      - per_criterion_rule_scores = {cid: math_equiv_score_ratio} (모든 기준 동일값)
+      - 파싱 실패 시 rule_ratio = 0.0 (평가 불가 → LLM 100% 의존)
     """
     student_full = state["student_answer"].strip()
     model_ans = state["model_answer"].strip()
     rubric = state.get("rubric") or {}
     total = float(rubric.get("total_score", 0))
+    rubric_items = rubric.get("rubric_items", [])
 
     errors: list[dict] = []
-    keyword_hits: list[str] = []
-    keyword_misses: list[str] = []
 
-    # ── 수식 동치성 검증 ──────────────────────────────────────────────────────
-    # 전체 자연어 텍스트 대신 답안에서 수식 후보를 추출해 시도
-    math_equiv = None
-    math_equiv_score_ratio = 0.0  # 0.0 ~ 1.0
-    parse_attempted = False
-
+    # ── 수식 후보 추출 ────────────────────────────────────────────────────────
     candidates = _extract_math_expressions(student_full)
-    # 후보가 없으면 전체 텍스트 그대로 시도 (순수 수식 답안 대비)
     if not candidates:
-        candidates = [student_full]
+        candidates = [student_full]  # 순수 수식 답안 대비 폴백
 
-    # 모범 답안 후보 추출 (한국어 혼재 대비)
-    # 한국어를 기준으로 세그먼트 분리 후 각각 추출 → 한국어 제거 시 식이 붙는 문제 방지
+    # 모범 답안 수식 후보 추출 (한국어 세그먼트 분리 후 각각 추출)
     _kor_chunks = re.split(r"[가-힣]+", model_ans)
     model_candidates: list[str] = []
     for chunk in _kor_chunks:
@@ -294,7 +287,7 @@ def _math_engine(state: GradingState) -> RuleMetadata:
             for cand in _extract_math_expressions(chunk):
                 if cand not in model_candidates:
                     model_candidates.append(cand)
-    # 등식 후보에서 RHS도 별도 추가 (f(x) = expr → expr 도 시도)
+    # 등식 RHS도 별도 후보로 추가 (f(x) = expr → expr 도 시도)
     for mc in list(model_candidates):
         if "=" in mc and not mc.startswith("=="):
             rhs = mc.split("=", 1)[1].strip()
@@ -303,28 +296,36 @@ def _math_engine(state: GradingState) -> RuleMetadata:
     if not model_candidates:
         model_candidates = [model_ans]
 
-    # 모든 후보 조합 시도 → 동치 판정 시 즉시 확정, 아니면 최초 파싱 성공 결과 보관
+    # ── 전체 동치성 검증 ──────────────────────────────────────────────────────
+    # 모든 학생↔모델 후보 조합 시도 → 동치 판정 시 즉시 확정
     best_result = None
     best_equiv = False
+    parse_attempted = False
 
     for candidate in candidates:
         for model_cand in model_candidates:
             result = verify_math(candidate, model_cand)
-            if result.method != "error":  # 파싱 성공
+            if result.method != "error":
                 parse_attempted = True
                 if result.is_equivalent:
                     best_result = result
                     best_equiv = True
                     break
                 elif best_result is None:
-                    best_result = result  # 첫 번째 파싱 성공 결과 보관
+                    best_result = result
         if best_equiv:
             break
 
     math_equiv = best_result.to_dict() if best_result else None
     math_equiv_score_ratio = 1.0 if best_equiv else 0.0
 
-    if best_result is not None and not best_equiv:
+    if not parse_attempted:
+        errors.append({
+            "type": "ParseError",
+            "span": student_full[:80],
+            "message": "답안에서 수식을 추출할 수 없습니다. Rule-base 점수는 0으로 처리됩니다.",
+        })
+    elif best_result is not None and not best_equiv:
         errors.append({
             "type": "MathEquivalenceError",
             "span": candidates[0] if candidates else student_full[:80],
@@ -334,57 +335,24 @@ def _math_engine(state: GradingState) -> RuleMetadata:
             ),
         })
 
-    if not parse_attempted:
-        # 모든 후보 파싱 실패 → 키워드 분석으로 대체
-        errors.append({
-            "type": "ParseError",
-            "span": student_full[:80],
-            "message": "답안에서 수식을 추출할 수 없어 키워드 분석으로 대체합니다.",
-        })
-
-    # ── 키워드 적중률 검사 (모범 답안 기반 루브릭 키워드) ─────────────────────
-    hit_score = 0.0
-    for item in rubric.get("rubric_items", []):
-        item_keywords: list[str] = item.get("keywords", [])
-        item_max: int = item.get("max_score", 0)
-        item_hits = [kw for kw in item_keywords if kw.lower() in student_full.lower()]
-        item_misses = [kw for kw in item_keywords if kw.lower() not in student_full.lower()]
-        keyword_hits.extend(item_hits)
-        keyword_misses.extend(item_misses)
-        if item_keywords:
-            hit_score += item_max * (len(item_hits) / len(item_keywords))
-        else:
-            hit_score += item_max  # 키워드 없는 기준은 만점 처리
-
-    keyword_score_ratio = hit_score / total if total > 0 else 0.0
-
-    # ── 기준별 rule-base 점수 (0~1) ──────────────────────────────────────────
-    rubric_items = rubric.get("rubric_items", [])
-    per_criterion_rule_scores: dict[str, float] = {}
-    for item in rubric_items:
-        cid = item.get("criterion_id", "")
-        per_criterion_rule_scores[cid] = _score_math_per_criterion(
-            student_candidates=candidates,
-            model_candidates=model_candidates,
-            criterion=item,
-            student_full=student_full,
-        )
+    # ── 전체 동치 결과를 모든 기준에 균등 적용 ───────────────────────────────
+    # 동치성 검증은 답안 전체에 대한 단일 결과이므로 기준별 구분 없이 동일값 부여.
+    # 이 비율이 ensemble_evaluator에서 0.1 × rule_ratio × max_score 로 점수에 반영됨.
+    per_criterion_rule_scores: dict[str, float] = {
+        item.get("criterion_id", ""): math_equiv_score_ratio
+        for item in rubric_items
+    }
     rule_base_total = round(sum(per_criterion_rule_scores.values()), 4)
-
-    # ── 요약 점수 (레거시 호환) ────────────────────────────────────────────────
-    if math_equiv is not None:
-        rule_score = total * (0.6 * math_equiv_score_ratio + 0.4 * keyword_score_ratio)
-    else:
-        rule_score = total * keyword_score_ratio
+    rule_score = round(total * math_equiv_score_ratio, 2)
 
     return RuleMetadata(
         subject_tag="math",
-        rule_score=round(rule_score, 2),
+        rule_score=rule_score,
         rule_max_score=total,
         errors=errors,
         math_equivalence=math_equiv,
-        keyword_hits=keyword_hits,
-        keyword_misses=keyword_misses,
+        keyword_hits=[],   # 수학: 키워드 매칭 없음
+        keyword_misses=[],
         per_criterion_rule_scores=per_criterion_rule_scores,
         rule_base_total=rule_base_total,
     )
